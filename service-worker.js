@@ -1,11 +1,10 @@
 // Service Worker for Lyric Film Studio - Offline v5
 // Handles adjacent demo-assets folder for web deployment
 // Cache version - bump to force update
-const CACHE_NAME = 'lyric-film-studio-v5';
+const CACHE_NAME = 'index.html';
 const APP_SHELL = [
   './',
-  './index.html',
-  './Lyric-Film-Studio-Offline_v5.html'
+  './index.html'
 ];
 
 const DEMO_ASSETS_FOLDER = 'demo-assets';
