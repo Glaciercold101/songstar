@@ -1,10 +1,9 @@
-// Service Worker for Lyric Film Studio - Offline v5
-// Handles adjacent demo-assets folder for web deployment
-// Cache version - bump to force update
-const CACHE_NAME = 'index.html';
+// SongStar V22/V23 - Fixed Service Worker - works with any HTML filename
+const CACHE_NAME = 'songstar-v24-tulip-1'; // bump this on each release
+// Don't hardcode index.html - cache root and current page, whatever it's called
 const APP_SHELL = [
-  './',
-  './index.html'
+  './'
+  // './index.html' removed - was causing 404 when file is named SongStar-V23-...html
 ];
 
 const DEMO_ASSETS_FOLDER = 'demo-assets';
@@ -17,18 +16,19 @@ const DEMO_ASSETS = [
   `./${DEMO_ASSETS_FOLDER}/outro.webp`
 ];
 
-const OFFLINE_URLS = [...APP_SHELL, ...DEMO_ASSETS];
+const OFFLINE_URLS = [...APP_SHELL]; // Don't pre-cache demo-assets - cache on demand, avoids 404 spam
 
 self.addEventListener('install', (event) => {
-  console.log('[LyricFilm SW] Install v5 - caching app shell + demo-assets');
+  console.log('[SW] Install', CACHE_NAME);
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
+      // Try to cache root, but don't fail install if it 404s
       return cache.addAll(OFFLINE_URLS.map(url => new Request(url, {cache: 'no-cache'}))).catch(err => {
-        console.warn('[LyricFilm SW] addAll failed, trying individually:', err);
+        console.log('[SW] Some files not found, caching what we can:', err.message);
         return Promise.allSettled(
           OFFLINE_URLS.map(u => 
             cache.add(new Request(u, {cache: 'no-cache'}))
-              .catch(e => console.warn('[LyricFilm SW] failed to cache', u, e))
+              .catch(e => console.log('[SW] Skipping', u))
           )
         );
       });
@@ -37,12 +37,12 @@ self.addEventListener('install', (event) => {
 });
 
 self.addEventListener('activate', (event) => {
-  console.log('[LyricFilm SW] Activate - cleaning old caches');
+  console.log('[SW] Activate - cleaning old caches');
   event.waitUntil(
     caches.keys().then((keys) => {
       return Promise.all(
         keys.filter(k => k !== CACHE_NAME).map(k => {
-          console.log('[LyricFilm SW] Deleting old cache', k);
+          console.log('[SW] Deleting old cache', k);
           return caches.delete(k);
         })
       );
@@ -55,8 +55,46 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return;
   
   const url = new URL(req.url);
+
+  // --- FIX 1: JSON files - never return HTML, always return valid JSON ---
+  if (url.pathname.endsWith('.json')) {
+    event.respondWith(
+      fetch(req).then(res => {
+        // If server returned HTML instead of JSON (SPA fallback), treat as fail
+        const contentType = res.headers.get('content-type') || '';
+        if (!res.ok || contentType.includes('text/html')) {
+          throw new Error('json not found, got html');
+        }
+        // Cache good json for offline
+        if (res.ok && req.url.startsWith(self.location.origin)) {
+          const clone = res.clone();
+          caches.open(CACHE_NAME).then(c => c.put(req, clone));
+        }
+        return res;
+      }).catch(() => {
+        // Try cache, else return empty valid JSON - prevents "<!doctype" crash
+        return caches.match(req).then(cached => {
+          if (cached) return cached;
+          return new Response('{}', {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        });
+      })
+    );
+    return;
+  }
+
+  // --- FIX 2: favicon.ico - return 204 if missing, never undefined ---
+  // Note: 204 must have null body, not empty string
+  if (url.pathname.endsWith('favicon.ico')) {
+    event.respondWith(
+      fetch(req).then(r => r.ok ? r : new Response(null, {status: 204}))
+        .catch(() => caches.match(req).then(c => c || new Response(null, {status: 204})))
+    );
+    return;
+  }
   
-  // Check if request is for demo-assets folder (adjacent folder)
   const isDemoAsset = url.pathname.includes(`/${DEMO_ASSETS_FOLDER}/`) || 
                       url.pathname.endsWith(`/${DEMO_ASSETS_FOLDER}`) ||
                       DEMO_ASSETS.some(path => url.pathname.endsWith(path.replace('./','')) || url.href.includes(path.replace('./','')));
@@ -68,17 +106,14 @@ self.addEventListener('fetch', (event) => {
   );
 
   if (isDemoAsset) {
-    // For demo-assets: cache-first, then network, then update cache
     event.respondWith(
       caches.match(req).then((cached) => {
         if (cached) {
-          // Update in background (stale-while-revalidate)
           fetch(req).then(res => {
             if (res.ok) caches.open(CACHE_NAME).then(c => c.put(req, res));
           }).catch(()=>{});
           return cached;
         }
-        // Not in cache, try network
         return fetch(req).then((res) => {
           if (res.ok) {
             const clone = res.clone();
@@ -86,8 +121,7 @@ self.addEventListener('fetch', (event) => {
           }
           return res;
         }).catch(() => {
-          console.warn('[LyricFilm SW] demo asset fetch failed', req.url);
-          return caches.match(req);
+          return caches.match(req).then(c => c || new Response('', {status: 404}));
         });
       })
     );
@@ -95,7 +129,6 @@ self.addEventListener('fetch', (event) => {
   }
 
   if (isAppShell) {
-    // For app shell: cache-first
     event.respondWith(
       caches.match(req).then((cached) => {
         if (cached) {
@@ -110,21 +143,28 @@ self.addEventListener('fetch', (event) => {
             caches.open(CACHE_NAME).then(c => c.put(req, clone));
           }
           return res;
-        }).catch(() => caches.match(req));
+        }).catch(() => {
+          return caches.match(req).then(c => c || new Response('Offline', {status: 503}));
+        });
       })
     );
     return;
   }
   
-  // For everything else (including ./demo-assets/* not in list, fonts, etc): network-first fallback to cache
+  // --- FIX 3: everything else - NEVER return undefined ---
   event.respondWith(
     fetch(req).then((res) => {
-      // Optionally cache successful GETs for offline
       if (res.ok && req.url.startsWith(self.location.origin)) {
         const clone = res.clone();
         caches.open(CACHE_NAME).then(c => c.put(req, clone));
       }
       return res;
-    }).catch(() => caches.match(req))
+    }).catch(() => {
+      return caches.match(req).then(cached => {
+        if (cached) return cached;
+        // Final fallback - always a Response, never undefined
+        return new Response('', {status: 404, statusText: 'Not found'});
+      });
+    })
   );
 });
